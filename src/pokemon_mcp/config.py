@@ -21,8 +21,8 @@ class Settings:
     api_key: str | None = field(repr=False)
     db_path: Path
     cache_ttl_seconds: float = 300.0
-    http_timeout_seconds: float = 10.0
-    max_retries: int = 3
+    http_timeout_seconds: float = 30.0
+    max_retries: int = 4
 
 
 def load_settings() -> Settings:

@@ -152,8 +152,11 @@ This project is meant as a security portfolio piece. The main controls:
 **Error handling and resilience**
 - Expected errors (bad input, card not found, API down) are returned as short messages.
 - Unexpected exceptions are logged to **stderr** only; stdout is reserved for the MCP protocol. The client sees a generic "Internal error" with no stack trace, paths or internals.
-- Every HTTP request has a timeout.
-- 429 and 5xx responses are retried with exponential backoff. `Retry-After` is honoured but capped at 30 seconds, so a hostile header can't stall the server.
+- Every HTTP request has a timeout: 5 seconds to connect and 30 seconds to read, because large set pages are slow.
+- Timeouts, network errors, 429 and 5xx responses are retried up to 4 times with exponential backoff plus jitter.
+- `Retry-After` is honoured but capped at 30 seconds, and the total wait per request is capped at 45 seconds. A hostile header or a long outage can't hang a tool call.
+- Errors are never cached, so the next call always tries the API fresh.
+- An empty or incomplete card list for a set is reported as an error, never as "0 of 0 owned".
 - Responses are cached in a bounded LRU/TTL cache, which limits memory use and request volume.
 - `snapshot_prices` isolates per-card failures, so one bad card doesn't abort the run.
 

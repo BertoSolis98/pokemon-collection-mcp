@@ -4,9 +4,14 @@ Card data comes from pokemontcg.io; the price is the TCGplayer USD "market"
 price that pokemontcg.io embeds in each card (raw / ungraded copies).
 
 Robustness features:
-  * every request has a timeout;
-  * 429 (rate limited) and 5xx responses are retried with exponential
-    backoff, honouring the server's Retry-After header (capped);
+  * every request has a timeout (short to connect, longer to read, because
+    pokemontcg.io can be slow to answer large set pages);
+  * timeouts, network errors, 429 (rate limited) and 5xx responses are
+    retried with exponential backoff plus jitter, honouring the server's
+    Retry-After header (capped), within an overall time budget so a tool
+    call never hangs for minutes;
+  * a set whose card list comes back empty or incomplete is treated as a
+    failure, never reported as "0 of 0 owned";
   * successful responses are cached for a few minutes;
   * all failures are turned into SourceError subclasses with safe messages.
 """
@@ -16,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -40,6 +46,9 @@ PRICE_VARIANTS = (
 )
 
 MAX_RETRY_AFTER_SECONDS = 30.0
+# Total time we are willing to spend sleeping between retries for one request.
+RETRY_BUDGET_SECONDS = 45.0
+CONNECT_TIMEOUT_SECONDS = 5.0
 SET_PAGE_SIZE = 250
 
 
@@ -50,9 +59,10 @@ class PokemonTCGSource(PriceSource):
         self,
         api_key: str | None = None,
         *,
-        timeout: float = 10.0,
-        max_retries: int = 3,
+        timeout: float = 30.0,
+        max_retries: int = 4,
         backoff_base: float = 1.0,
+        retry_budget: float = RETRY_BUDGET_SECONDS,
         cache: TTLCache | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -62,10 +72,14 @@ class PokemonTCGSource(PriceSource):
             headers["X-Api-Key"] = api_key
         # `transport` lets tests plug in httpx.MockTransport: no real network.
         self._client = httpx.AsyncClient(
-            base_url=BASE_URL, headers=headers, timeout=timeout, transport=transport
+            base_url=BASE_URL,
+            headers=headers,
+            timeout=httpx.Timeout(timeout, connect=min(timeout, CONNECT_TIMEOUT_SECONDS)),
+            transport=transport,
         )
         self._max_retries = max_retries
         self._backoff_base = backoff_base
+        self._retry_budget = retry_budget
         self._cache = cache if cache is not None else TTLCache()
         self._sleep = sleep
 
@@ -116,9 +130,20 @@ class PokemonTCGSource(PriceSource):
             batch = data.get("data", [])
             cards.extend(_parse_card(c) for c in batch)
             total = int(data.get("totalCount", len(cards)))
-            if not batch or len(cards) >= total:
+            if len(cards) >= total:
                 break
+            if not batch:
+                # The API said there are more cards but sent none: an
+                # incomplete answer must not be reported as real progress.
+                raise SourceUnavailableError(
+                    f"The card API returned an incomplete card list for set '{chosen.get('name', set_name)}'. "
+                    "Try again shortly."
+                )
             page += 1
+        if not cards:
+            raise SourceUnavailableError(
+                f"The card API returned no cards for set '{chosen.get('name', set_name)}'. Try again shortly."
+            )
         return SetInfo(id=set_id, name=chosen.get("name", set_name), cards=cards)
 
     # --- HTTP plumbing -----------------------------------------------------
@@ -130,8 +155,13 @@ class PokemonTCGSource(PriceSource):
             return cached
 
         last_problem = "unknown error"
+        slept = 0.0
+        attempts = 0
         for attempt in range(self._max_retries + 1):
-            delay = self._backoff_base * (2**attempt)
+            attempts += 1
+            base = self._backoff_base * (2**attempt)
+            # Jitter spreads retries out so they don't hammer a struggling API in lockstep.
+            delay = base + random.uniform(0, base * 0.25)
             try:
                 resp = await self._client.get(path, params=params)
             except httpx.TimeoutException:
@@ -161,11 +191,18 @@ class PokemonTCGSource(PriceSource):
                 else:
                     raise SourceError(f"The card API returned an unexpected status ({resp.status_code}).")
 
-            if attempt < self._max_retries:
-                log.warning("pokemontcg.io: %s; retrying in %.1fs", last_problem, delay)
-                await self._sleep(delay)
+            if attempt == self._max_retries or slept + delay > self._retry_budget:
+                break
+            log.warning(
+                "pokemontcg.io: %s (attempt %d); retrying in %.1fs", last_problem, attempts, delay
+            )
+            await self._sleep(delay)
+            slept += delay
 
-        raise SourceUnavailableError(f"Card API unavailable: {last_problem}. Try again shortly.")
+        raise SourceUnavailableError(
+            f"Card API unavailable: {last_problem} (gave up after {attempts} attempts). "
+            "Try again shortly."
+        )
 
 
 def _retry_after(resp: httpx.Response, default: float) -> float:

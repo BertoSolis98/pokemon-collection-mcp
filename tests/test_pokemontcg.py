@@ -169,3 +169,80 @@ def test_ttl_cache_is_bounded():
     for k in "abc":
         cache.set(k, k)
     assert cache.get("a") is None and cache.get("c") == "c"
+
+
+# --- resilience against a flaky upstream -------------------------------------
+
+async def test_502_then_success_is_transparent():
+    rec = Recorder(httpx.Response(502), httpx.Response(502),
+                   httpx.Response(200, json={"data": CHARIZARD}))
+    card = await make_source(rec).get_card("base1-4")
+    assert card.id == "base1-4" and len(rec.requests) == 3
+
+
+async def test_error_message_says_how_many_attempts():
+    rec = Recorder(httpx.Response(500))
+    with pytest.raises(SourceUnavailableError, match="after 5 attempts"):
+        await make_source(rec).get_card("base1-4")  # default: 1 try + 4 retries
+
+
+async def test_retry_budget_caps_total_wait():
+    slept: list[float] = []
+
+    async def fake_sleep(s):
+        slept.append(s)
+
+    rec = Recorder(httpx.Response(503))
+    with pytest.raises(SourceUnavailableError):
+        await make_source(rec, sleep=fake_sleep, max_retries=10, retry_budget=10).get_card("base1-4")
+    assert sum(slept) <= 10
+
+
+async def test_errors_are_not_cached():
+    rec = Recorder(httpx.Response(500), httpx.Response(200, json={"data": CHARIZARD}))
+    src = make_source(rec, max_retries=0)
+    with pytest.raises(SourceUnavailableError):
+        await src.get_card("base1-4")
+    assert (await src.get_card("base1-4")).id == "base1-4"  # retried fresh, not a cached error
+
+
+async def test_set_with_empty_card_list_is_an_error_not_zero_progress():
+    rec = Recorder(
+        httpx.Response(200, json={"data": [{"id": "base1", "name": "Base"}]}),
+        httpx.Response(200, json={"data": [], "totalCount": 0}),
+    )
+    with pytest.raises(SourceUnavailableError, match="no cards"):
+        await make_source(rec).get_set("Base")
+
+
+async def test_set_with_incomplete_pages_is_an_error():
+    rec = Recorder(
+        httpx.Response(200, json={"data": [{"id": "base1", "name": "Base"}]}),
+        httpx.Response(200, json={"data": [CHARIZARD], "totalCount": 102}),
+        httpx.Response(200, json={"data": [], "totalCount": 102}),
+    )
+    with pytest.raises(SourceUnavailableError, match="incomplete"):
+        await make_source(rec).get_set("Base")
+
+
+# --- price variant selection -------------------------------------------------
+
+async def test_first_edition_only_card_gets_a_price():
+    machamp = {**CHARIZARD, "id": "base1-8", "name": "Machamp",
+               "tcgplayer": {"prices": {"1stEditionHolofoil": {"market": 42.0}}}}
+    rec = Recorder(httpx.Response(200, json={"data": machamp}))
+    assert (await make_source(rec).get_card("base1-8")).market_price == 42.0
+
+
+async def test_empty_preferred_variant_falls_through_to_next():
+    raw = {**CHARIZARD, "tcgplayer": {"prices": {
+        "holofoil": {"market": None, "low": 5.0},
+        "1stEditionHolofoil": {"market": 99.0}}}}
+    rec = Recorder(httpx.Response(200, json={"data": raw}))
+    assert (await make_source(rec).get_card("base1-4")).market_price == 99.0
+
+
+async def test_unknown_variant_name_still_priced():
+    raw = {**CHARIZARD, "tcgplayer": {"prices": {"shadowlessHolofoil": {"market": 500.0}}}}
+    rec = Recorder(httpx.Response(200, json={"data": raw}))
+    assert (await make_source(rec).get_card("base1-4")).market_price == 500.0
