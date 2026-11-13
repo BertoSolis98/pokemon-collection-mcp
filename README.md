@@ -90,11 +90,16 @@ flowchart LR
         Tools["server.py<br/>8 MCP tools<br/>read-only | write"] --> Service["service.py<br/>business logic<br/>+ input validation (models.py)"]
         Service --> DB["db.py<br/>parameterized SQL"]
         Service --> Iface["sources/base.py<br/>PriceSource interface"]
-        Iface --> Impl["sources/pokemontcg.py<br/>timeouts · retries · TTL cache"]
+        Iface --> FB["sources/fallback.py<br/>failover + circuit breaker"]
+        FB -- "primary: search, sets, prices" --> Impl["sources/pokemontcg.py"]
+        FB -- "backup: prices only" --> Dex["sources/tcgdex.py<br/>id translation · USD only"]
+        Impl --> HTTP["sources/http.py<br/>timeouts · retries · TTL cache"]
+        Dex --> HTTP
     end
 
     DB --> SQLite[("SQLite<br/>cards · collection<br/>price_snapshots")]
-    Impl -- "HTTPS + X-Api-Key" --> API["pokemontcg.io API<br/>(TCGplayer prices)"]
+    HTTP -- "HTTPS + X-Api-Key" --> API["pokemontcg.io API<br/>(TCGplayer prices)"]
+    HTTP -- "HTTPS" --> TCGdex["TCGdex API<br/>(TCGplayer USD prices)"]
 ```
 
 | File | Responsibility |
@@ -105,7 +110,10 @@ flowchart LR
 | `db.py` | SQLite schema and queries. All queries are parameterized. |
 | `config.py` | Loads settings and secrets from the environment and `.env`. |
 | `sources/base.py` | The `PriceSource` interface. To add TCGdex, implement this one class. |
-| `sources/pokemontcg.py` | pokemontcg.io client: timeouts, 429/5xx retry with backoff, caching. |
+| `sources/pokemontcg.py` | pokemontcg.io client: the primary source for search, sets and prices. |
+| `sources/tcgdex.py` | TCGdex client, a backup source for prices only. Translates card ids and only uses TCGplayer USD prices. |
+| `sources/fallback.py` | Wraps both sources: tries the primary first, switches to the backup during outages, and has a circuit breaker. |
+| `sources/http.py` | Shared HTTP layer: timeouts, retries with backoff and jitter, retry budget, caching, safe error messages. |
 | `sources/cache.py` | Small bounded in-memory TTL cache. |
 
 ### Data model
@@ -119,6 +127,20 @@ flowchart LR
 - `collection_value` uses the latest saved snapshot for each card. If a card has none, it asks the API without saving anything, because the tool is read-only.
 - Gain/loss only counts copies with a known purchase price.
 - Copies added without a purchase price are reported separately.
+
+## Price fallback (TCGdex)
+
+pokemontcg.io sometimes returns 500/502 errors for minutes at a time. When that happens, **prices** fall back to the free [TCGdex](https://tcgdex.dev) API:
+
+- **Only prices fall back.** Search and set lists always use pokemontcg.io, so every card id in your database stays in one format.
+- **Card ids are translated.** For example, pokemontcg.io's `sv3pt5-6` becomes TCGdex's `sv03.5-006`. Your database always keeps the original id.
+- **Only TCGplayer USD prices are used.** TCGdex also has Cardmarket prices, but they're in EUR from a different marketplace. Mixing them in would make exchange-rate moves look like price changes.
+- **Backup answers never overwrite card details.** If pokemontcg.io knows a card but has no price, TCGdex may supply just the price.
+- **Circuit breaker:** after pokemontcg.io fails, it is skipped for 5 minutes. Without that, `snapshot_prices` would wait out the whole retry budget once per card during an outage.
+- **Every snapshot records where its price came from** (`source` in `price_history`).
+- A real "card not found" from pokemontcg.io is *not* retried on TCGdex.
+
+To disable the fallback, set `POKEMON_MCP_PRICE_FALLBACK=off`.
 
 ## Security design
 
@@ -147,7 +169,7 @@ This project is meant as a security portfolio piece. The main controls:
 
 **Least privilege for tools**
 - Read-only and write tools are separated and labelled (see the table above). `remove_card` is flagged `destructiveHint=True`, so clients can ask before running it.
-- No tool can run arbitrary SQL, touch arbitrary files or call arbitrary URLs. The only outbound host is `api.pokemontcg.io`.
+- No tool can run arbitrary SQL, touch arbitrary files or call arbitrary URLs. The only outbound hosts are the fixed `api.pokemontcg.io` and `api.tcgdex.net`.
 
 **Error handling and resilience**
 - Expected errors (bad input, card not found, API down) are returned as short messages.
@@ -156,6 +178,7 @@ This project is meant as a security portfolio piece. The main controls:
 - Timeouts, network errors, 429 and 5xx responses are retried up to 4 times with exponential backoff plus jitter.
 - `Retry-After` is honoured but capped at 30 seconds, and the total wait per request is capped at 45 seconds. A hostile header or a long outage can't hang a tool call.
 - Errors are never cached, so the next call always tries the API fresh.
+- **Data integrity:** each saved price records its source. Prices are USD only and never converted from another currency. A backup source can never rename your cards.
 - An empty or incomplete card list for a set is reported as an error, never as "0 of 0 owned".
 - Responses are cached in a bounded LRU/TTL cache, which limits memory use and request volume.
 - `snapshot_prices` isolates per-card failures, so one bad card doesn't abort the run.

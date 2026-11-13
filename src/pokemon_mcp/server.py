@@ -144,8 +144,10 @@ def main() -> None:
     # stdio transport: stdout carries the MCP protocol, so logs go to stderr.
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    from .sources.pokemontcg import PokemonTCGSource
     from .sources.cache import TTLCache
+    from .sources.fallback import FallbackPriceSource
+    from .sources.pokemontcg import PokemonTCGSource
+    from .sources.tcgdex import TCGdexSource
 
     settings = load_settings()
     if not settings.api_key:
@@ -157,6 +159,13 @@ def main() -> None:
         max_retries=settings.max_retries,
         cache=TTLCache(settings.cache_ttl_seconds),
     )
+    if settings.price_fallback:
+        # Prices fall back to TCGdex (TCGplayer USD only) when pokemontcg.io is down.
+        source = FallbackPriceSource(
+            source,
+            TCGdexSource(timeout=settings.http_timeout_seconds,
+                         cache=TTLCache(settings.cache_ttl_seconds)),
+        )
     build_server(CollectionService(db, source)).run()
 
 

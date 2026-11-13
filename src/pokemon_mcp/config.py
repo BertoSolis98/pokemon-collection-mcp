@@ -23,6 +23,7 @@ class Settings:
     cache_ttl_seconds: float = 300.0
     http_timeout_seconds: float = 30.0
     max_retries: int = 4
+    price_fallback: bool = True
 
 
 def load_settings() -> Settings:
@@ -34,4 +35,8 @@ def load_settings() -> Settings:
     db_path_raw = os.getenv("POKEMON_MCP_DB_PATH", "").strip()
     db_path = Path(db_path_raw).expanduser() if db_path_raw else DEFAULT_DB_PATH
 
-    return Settings(api_key=api_key, db_path=db_path)
+    # Set POKEMON_MCP_PRICE_FALLBACK=off to disable the TCGdex price fallback.
+    fallback_raw = os.getenv("POKEMON_MCP_PRICE_FALLBACK", "on").strip().lower()
+    price_fallback = fallback_raw not in ("off", "0", "false", "no")
+
+    return Settings(api_key=api_key, db_path=db_path, price_fallback=price_fallback)

@@ -110,7 +110,10 @@ class CollectionService:
             "card_id": card_id,
             "name": card.name if card else None,
             "days": days,
-            "points": [{"date": s.captured_date.isoformat(), "price": s.price} for s in snaps],
+            "points": [
+                {"date": s.captured_date.isoformat(), "price": s.price, "source": s.source}
+                for s in snaps
+            ],
         }
         if not snaps:
             result["note"] = (
@@ -193,11 +196,11 @@ class CollectionService:
         price = validate_price(purchase_price)
 
         card = await self.source.get_card(card_id)  # confirms the card exists
-        self.db.upsert_card(card)
+        self._store_card(card)
         today = self._today()
         owned = self.db.add_lot(card.id, cond, quantity, price, today)
         if card.market_price is not None:
-            self.db.save_snapshot(card.id, card.market_price, self.source.name, today)
+            self.db.save_snapshot(card.id, card.market_price, _origin(card, self.source), today)
         return {
             "added": quantity, "card": _card_dict(card), "condition": cond.value,
             "purchase_price_each": price, "total_owned": owned,
@@ -221,18 +224,28 @@ class CollectionService:
             except SourceError as exc:
                 failed.append({"card_id": card_id, "error": str(exc)})
                 continue  # one bad card shouldn't stop the whole run
-            self.db.upsert_card(card)
+            self._store_card(card)
             if card.market_price is None:
                 no_price.append(card_id)
                 continue
-            self.db.save_snapshot(card.id, card.market_price, self.source.name, today)
-            saved.append({"card_id": card.id, "price": card.market_price})
+            origin = _origin(card, self.source)
+            self.db.save_snapshot(card.id, card.market_price, origin, today)
+            saved.append({"card_id": card.id, "price": card.market_price, "source": origin})
         return {
-            "date": today.isoformat(), "source": self.source.name,
+            "date": today.isoformat(),
             "saved": len(saved), "prices": saved, "no_price": no_price, "failed": failed,
         }
 
     # --- helpers -----------------------------------------------------------
+
+    def _store_card(self, card: Card) -> None:
+        """Save card metadata, but never let a backup provider's naming
+        ("Base Set" vs "Base", "sv03.5" vs "sv3pt5") overwrite what the
+        primary source already stored. Backup answers only contribute prices."""
+        from_backup = card.price_source is not None and card.price_source != self.source.name
+        if from_backup and self.db.get_card(card.id) is not None:
+            return
+        self.db.upsert_card(card)
 
     async def _current_price(self, card_id: str) -> tuple[float | None, str | None]:
         """Latest saved snapshot; if none exists, ask the source (without saving)."""
@@ -244,6 +257,10 @@ class CollectionService:
         except SourceError:
             return None, None
         return card.market_price, (self._today().isoformat() if card.market_price is not None else None)
+
+
+def _origin(card: Card, source: PriceSource) -> str:
+    return card.price_source or source.name
 
 
 def _card_dict(c: Card) -> dict[str, Any]:

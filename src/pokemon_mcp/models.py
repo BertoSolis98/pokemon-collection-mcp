@@ -42,6 +42,9 @@ class Card:
     image_url: str | None = None
     # TCGplayer USD market price for a raw (ungraded) copy, if known.
     market_price: float | None = None
+    # Which provider the price came from (set by fallback sources so price
+    # history records the true origin of every number). None = this source.
+    price_source: str | None = None
 
 
 @dataclass(frozen=True)
