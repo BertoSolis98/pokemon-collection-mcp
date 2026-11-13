@@ -1,1 +1,24 @@
+# Secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
+# Local database (contains your personal collection data)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
 .venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
